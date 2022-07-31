@@ -171,17 +171,29 @@ For example, the initialization file required to spin up your serverless functio
 Also, depending on whether you want to run a typical HTTP application with multiple routes/endpoints or just provide a single route (or execute a specific portion of code),
 your application's code will look different (for example, for the endpoint-per-function approach you could use the `NestFactory.createApplicationContext` instead of booting the HTTP server, setting up middleware, etc.).
 
-Just for illustration purposes, we'll integrate Nest (using `@nestjs/platform-express` and so spinning up the whole, fully functional HTTP router)
-with the [Serverless](https://www.serverless.com/) framework (in this case, targetting AWS Lambda). As we've mentioned earlier, your code will differ depending on the cloud provider you choose, and many other factors.
+Just for illustration purposes, we'll integrate Nest (using `@nestjs/platform-express` and so spinning up the whole, fully functional HTTP router) targetting AWS Lambda.
+To create a zip file for AWS Lambda, we can take two approaches:
+
+First, by bundle your NestJS app, with this option we reduce cold boot, instead of 10MB~20MB zip file, your lambda can be less than 1MB in size depending on what packages you include.
+But using this approach you will have some problems when working with libraries like `typeorm`, `pg` and any other library that depends on decorators and folder structure.
+
+Second, leave it as it is, we don't have a good name for it, but it's really leave it as is, instead of trying to bundle your entire application into just one file, we just zip up the entire `dist` and `node_modules` folder.
+This approach can produce larger zip files, but it has a benefit that it is very simple to deploy and works great with libraries that rely on folder structure (eg `typeorm`).
+
+What approach do we recommend? Well, go with the second option first, if your NestJS application already supports serverless environments (because it is stateless), you can deploy your application with almost no tweaks.
+So if cold booting has become an issue for you, start exploring the first option or go back and try [runtime-optimizations](#runtime-optimizations).
+
+##### Bundle your NestJS
 
 First, let's install the required packages:
 
 ```bash
-$ npm i @vendia/serverless-express aws-lambda
-$ npm i -D @types/aws-lambda serverless-offline
+$ npm i @vendia/serverless-express
+$ npm i -D @types/aws-lambda serverless-offline serverless-bundle serverless-dotenv-plugin
 ```
 
-> info **Hint** To speed up development cycles, we install the `serverless-offline` plugin which emulates AWS λ and API Gateway.
+To test how this will work in serverless environment, we install the `serverless-offline` plugin which emulates AWS λ and API Gateway. Also, we are using a package called `serverless-bundle` which simplify many configurations of webpack, visit the [official documentation](https://github.com/AnomalyInnovations/serverless-bundle).
+And finally, to make things work well with `.env` variables, we install `serverless-dotenv-plugin`.
 
 Once the installation process is complete, let's create the `serverless.yml` file to configure the Serverless framework:
 
@@ -189,15 +201,45 @@ Once the installation process is complete, let's create the `serverless.yml` fil
 service: serverless-example
 
 plugins:
+  - serverless-bundle # Package our functions with Webpack
   - serverless-offline
+  - serverless-dotenv-plugin # Load .env as environment variables
+
+custom:
+  bundle:
+    sourcemaps: false                # Enable source maps
+    caching: true                   # Enable Webpack caching
+    concurrency: 5                  # Set desired concurrency, defaults to the number of available cores
+    stats: false                    # Don't print out any Webpack output
+    linting: false                   # Enable linting as a part of the build process
+    generateStatsFiles: false       # Creates stats files that could be used for bundle analyzing, more below
+    esbuild: false                  # Use esbuild-loader instead of babel or ts for faster builds
+    disableForkTsChecker: false     # Disable the ForkTsChecker plugin, more below
+    tsConfig: "tsconfig.json"       # Path to your 'tsconfig.json', if it's not in the root
+    forceExclude: # Don't include these in the package
+      - aws-sdk             # Because it'll be provided through a Lambda Layer
+    ignorePackages:
+      - "@nestjs/websockets/socket-module"
+      - "@nestjs/microservices/microservices-module"
+      - "@nestjs/microservices"
+      - "cache-manager"
+      - "class-validator"
+      - "class-transformer"
+    excludeFiles:
+      - "**/*.test.ts"    # Exclude files from Webpack that match the glob
+      - "**/*.e2e-spec.ts"    # Exclude files from Webpack that match the glob
+      - "**/*.spec.ts"    # Exclude files from Webpack that match the glob
+    packager: npm                   # Specify a packager, 'npm' or 'yarn'. Defaults to 'npm'.
 
 provider:
   name: aws
   runtime: nodejs14.x
+# profile: your_profile
+# Hint: if you deploy for more aws accounts, change this profile to match for each aws account, those profiles at located in $HOME/.aws/credentials
 
 functions:
   main:
-    handler: dist/main.handler
+    handler: dist/lambda.handler
     events:
       - http:
           method: ANY
@@ -209,35 +251,51 @@ functions:
 
 > info **Hint** To learn more about the Serverless framework, visit the [official documentation](https://www.serverless.com/framework/docs/).
 
-With this place, we can now navigate to the `main.ts` file and update our bootstrap code with the required boilerplate:
+With that in place, we can now create a file called `lambda.ts` inside `src` and place the necessary boilerplate:
 
 ```typescript
 import { NestFactory } from '@nestjs/core';
-import serverlessExpress from '@vendia/serverless-express';
-import { Callback, Context, Handler } from 'aws-lambda';
+import { default as serverlessExpress } from '@vendia/serverless-express';
+import type { Callback, Context, Handler } from 'aws-lambda';
 import { AppModule } from './app.module';
 
 let server: Handler;
 
 async function bootstrap(): Promise<Handler> {
   const app = await NestFactory.create(AppModule);
+
   await app.init();
 
   const expressApp = app.getHttpAdapter().getInstance();
+
   return serverlessExpress({ app: expressApp });
 }
+
+// This is a simple trick inspired by this article
+// https://aws.amazon.com/pt/blogs/compute/using-node-js-es-modules-and-top-level-await-in-aws-lambda/
+// This can save you up to one second from cold start.
+const delayedFactory: Promise<Handler> = Promise.resolve()
+  .then(() => bootstrap())
+  .then((app) => {
+    server = app;
+
+    return app;
+  });
 
 export const handler: Handler = async (
   event: any,
   context: Context,
   callback: Callback,
 ) => {
-  server = server ?? (await bootstrap());
+  server = server ?? (await delayedFactory);
+
   return server(event, context, callback);
 };
 ```
 
 > info **Hint** For creating multiple serverless functions and sharing common modules between them, we recommend using the [CLI Monorepo mode](/cli/monorepo#monorepo-mode).
+
+> info **Hint** It's really recommended to have one file called `setup.ts` to share common configurations to use inside `lambda.ts` and `main.ts`.
 
 > warning **Warning** If you use `@nestjs/swagger` package, there are a few additional steps required to make it work properly in the context of serverless function. Check out this [article](https://javascript.plainenglish.io/serverless-nestjs-document-your-api-with-swagger-and-aws-api-gateway-64a53962e8a2) for more information.
 
@@ -261,48 +319,170 @@ $ npx serverless offline
 
 Once the application is running, open your browser and navigate to `http://localhost:3000/dev/[ANY_ROUTE]` (where `[ANY_ROUTE]` is any endpoint registered in your application).
 
-In the sections above, we've shown that using `webpack` and bundling your app can have significant impact on the overall bootstrap time.
-However, to make it work with our example, there are a few additional configurations you must add in your `webpack.config.js` file. Generally,
-to make sure our `handler` function will be picked up, we must change the `output.libraryTarget` property to `commonjs2`.
+The workflow we recommend for you to work without a server is: to develop, run the NestJS application with `nest start`. After developing some features, build your app and test with `npx serverless offline`
+and then deploy to AWS Lambda.
 
-```javascript
-return {
-  ...options,
-  externals: [],
-  output: {
-    ...options.output,
-    libraryTarget: 'commonjs2',
-  },
-  // ... the rest of the configuration
+> info **Hint** If you already have AWS Lambda configured, you can use this configuration just to create the zip needed to update your function, just run `npx serverless package`.
+
+##### Zip the entire node_modules
+
+First, let's install the required packages:
+
+```bash
+$ npm i @vendia/serverless-express
+$ npm i -D @types/aws-lambda @h4ad/node-modules-packer
+```
+
+With that in place, we can now create a file called `lambda.ts` inside `src` and place the necessary boilerplate:
+
+```typescript
+import { NestFactory } from '@nestjs/core';
+import { default as serverlessExpress } from '@vendia/serverless-express';
+import type { Callback, Context, Handler } from 'aws-lambda';
+import { AppModule } from './app.module';
+
+let server: Handler;
+
+async function bootstrap(): Promise<Handler> {
+  const app = await NestFactory.create(AppModule);
+
+  await app.init();
+
+  const expressApp = app.getHttpAdapter().getInstance();
+
+  return serverlessExpress({ app: expressApp });
+}
+
+// This is a simple trick inspired by this article
+// https://aws.amazon.com/pt/blogs/compute/using-node-js-es-modules-and-top-level-await-in-aws-lambda/
+// This can save you up to one second from cold start.
+const delayedFactory: Promise<Handler> = Promise.resolve()
+  .then(() => bootstrap())
+  .then((app) => {
+    server = app;
+
+    return app;
+  });
+
+export const handler: Handler = async (
+  event: any,
+  context: Context,
+  callback: Callback,
+) => {
+  server = server ?? (await delayedFactory);
+
+  return server(event, context, callback);
 };
 ```
 
-With this in place, you can now use `$ nest build --webpack` to compile your function's code (and then `$ npx serverless offline` to test it).
+> info **Hint** It's really recommended to have one file called `setup.ts` to share common configurations to use inside `lambda.ts` and `main.ts`.
 
-It's also recommended (but **not required** as it will slow down your build process) to install the `terser-webpack-plugin` package and override its configuration to keep classnames intact when minifying your production build. Not doing so can result in incorrect behavior when using `class-validator` within your application.
+> warning **Warning** If you use `@nestjs/swagger` package, there are a few additional steps required to make it work properly in the context of serverless function. Check out this [article](https://javascript.plainenglish.io/serverless-nestjs-document-your-api-with-swagger-and-aws-api-gateway-64a53962e8a2) for more information.
 
-```javascript
-const TerserPlugin = require('terser-webpack-plugin');
+Next, open up the `tsconfig.json` file and make sure to enable the `esModuleInterop` option to make the `@vendia/serverless-express` package load properly.
 
-return {
-  ...options,
-  externals: [],
-  optimization: {
-    minimizer: [
-      new TerserPlugin({
-        terserOptions: {
-          keep_classnames: true,
-        },
-      }),
-    ],
-  },
-  output: {
-    ...options.output,
-    libraryTarget: 'commonjs2',
-  },
-  // ... the rest of the configuration
-};
+```json
+{
+  "compilerOptions": {
+    ...
+    "esModuleInterop": true
+  }
+}
 ```
+
+So we need a way to create the zip file, we will use the library called [@h4ad/node-modules-packer](https://github.com/H4ad/node-modules-packer) which provides a way
+to compress the entire `node_modules` and `dist` folder and also provide a way to shrink the zip file a bit by making some tweaks.
+
+Well, let's create a file in the root folder called `packer.ts` and put the following code:
+
+```typescript
+import Run from '@h4ad/node-modules-packer/lib/commands/run';
+
+async function zipFiles() {
+  const result = await Run.headless({
+    // choose the root folder which contains the node_modules
+    dir: './',
+
+    // choose which folders of node_modules will be excluded from zip
+    // these one you can safety removed from your zip
+    ignoreNodePath: ['typeorm/browser', 'aws-crt/dist/bin', 'aws-crt/dist.browser', 'sqlite3', 'aws-sdk'],
+
+    // here you can include as many files you want to put inside your zip file.
+    include: ['dist'],
+
+    // here you can include file extensions to be excluded from your zip (eg: .d.ts, .js.map, these one already is removed by default)
+    // see https://github.com/H4ad/node-modules-packer/blob/master/src/common/extensions.ts to know the default excluded extensions
+    ignoreFileExt: [],
+
+    // the output path for your zip file
+    outputPath: './',
+
+    // the name of the output file
+    outputFile: 'deploy.zip',
+  });
+
+  console.log(result);
+}
+
+zipFiles();
+```
+
+With these configurations, let's generate the zip file with:
+
+```bash
+$ npm run build
+$ npx ts-node packer.ts
+```
+
+This will produce a file called `deploy.zip` in the root folder, we can use this folder to deploy to AWS Lambda.
+
+> info **Hint** At this point, you have enough to deploy your API to AWS Lambda, if you have already configured the services, just upload the zip manually.
+
+But to have a better workflow, we can use [framework serverless](https://www.serverless.com/framework/docs/), first we need to create `serverless.yml`.
+
+```yaml
+service: serverless-example
+
+plugins:
+  - serverless-offline
+  - serverless-dotenv-plugin # Load .env as environment variables
+
+package:
+  individually: true
+
+provider:
+  name: aws
+  runtime: nodejs14.x
+# profile: your_profile
+# Hint: if you deploy for more aws accounts, change this profile to match for each aws account, those profiles at located in $HOME/.aws/credentials
+
+functions:
+  main:
+    handler: dist/lambda.handler
+    package:
+      artifact: deploy.zip
+    events:
+      - http:
+          method: ANY
+          path: /
+      - http:
+          method: ANY
+          path: '{proxy+}'
+```
+
+With these settings, to test we can run:
+
+```bash
+$ npm run build
+$ npx ts-node packer.ts
+$ npx serverless offline
+```
+
+This looks a lot like the package option, but with this option we load all your `node_modules`, for some comparison,
+the first option will generate a zip file with ~530kb but the second option will generate a zip file with 7.3mb.
+
+That's it, at this point we recommend the same workflow we described in the package option: to develop, run the NestJS application with `nest start`.
+Once you've developed some features, build your app and test with `npx serverless offline`, then deploy to AWS Lambda.
 
 #### Using standalone application feature
 
